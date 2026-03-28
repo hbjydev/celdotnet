@@ -1,5 +1,7 @@
 # CelDotNet
 
+[![CI](https://github.com/hbjydev/celdotnet/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hbjydev/celdotnet/actions/workflows/ci.yml)
+
 A [Common Expression Language (CEL)](https://cel.dev) implementation for .NET that compiles CEL expressions into `System.Linq.Expression` trees -- making it possible to use CEL filters directly with Entity Framework Core, `IQueryable`, or in-memory evaluation.
 
 Unlike other .NET CEL libraries, CelDotNet doesn't just evaluate expressions -- it produces `Expression<Func<T, bool>>`, which means your CEL filters can be translated all the way down to SQL. Zero protobuf dependency. Zero runtime dependencies in the core package.
