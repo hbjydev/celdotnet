@@ -156,7 +156,7 @@ var results = await db.People
 - [x] Integration tests with SQLite in-memory (43 new tests, 352 total passing)
 
 ### Phase 6: Conformance & Polish
-- [ ] Conformance test runner against official `cel-spec` suite
+- [x] Conformance test runner against official `cel-spec` suite
 - [x] Performance benchmarks
 - [ ] NuGet packaging + publish config
 

@@ -62,6 +62,7 @@ internal sealed class ExpressionCompiler
         CelExpr.Binary binary => VisitBinary(binary),
         CelExpr.Conditional cond => VisitConditional(cond),
         CelExpr.CreateList list => VisitCreateList(list),
+        CelExpr.CreateMap map => VisitCreateMap(map),
         CelExpr.Comprehension comp => VisitComprehension(comp),
         _ => throw new CelException($"unsupported AST node: {expr.GetType().Name}"),
     };
@@ -75,7 +76,9 @@ internal sealed class ExpressionCompiler
         return lit.TypeKind switch
         {
             CelTypeKind.Bool => LinqExpression.Constant((bool)lit.Value!, typeof(bool)),
-            CelTypeKind.Int => LinqExpression.Constant(lit.Value!, typeof(long)),
+            CelTypeKind.Int => lit.Value is ulong
+                ? LinqExpression.Constant(lit.Value, typeof(ulong))   // overflow literal, compiler will fold in VisitNegate
+                : LinqExpression.Constant(lit.Value!, typeof(long)),
             CelTypeKind.Uint => LinqExpression.Constant(lit.Value!, typeof(ulong)),
             CelTypeKind.Double => LinqExpression.Constant(lit.Value!, typeof(double)),
             CelTypeKind.String => LinqExpression.Constant((string)lit.Value!, typeof(string)),
@@ -116,15 +119,32 @@ internal sealed class ExpressionCompiler
         var operand = Visit(index.Operand);
         var key = Visit(index.Key);
 
+        // Array indexing: arr[int]
+        if (operand.Type.IsArray)
+        {
+            var elementType = operand.Type.GetElementType()!;
+            var intKey = EnsureType(key, typeof(int));
+            return LinqExpression.ArrayIndex(operand, intKey);
+        }
+
+        // Dictionary indexing
+        if (operand.Type.IsGenericType && operand.Type.GetGenericTypeDefinition() == typeof(Dictionary<,>))
+        {
+            var keyType = operand.Type.GetGenericArguments()[0];
+            var indexer = operand.Type.GetProperty("Item")!;
+            var convertedKey = EnsureType(key, keyType);
+            return LinqExpression.MakeIndex(operand, indexer, [convertedKey]);
+        }
+
         // Try to find an indexer on the type
-        var indexer = operand.Type.GetProperties()
+        var genericIndexer = operand.Type.GetProperties()
             .FirstOrDefault(p => p.GetIndexParameters().Length == 1);
 
-        if (indexer is not null)
+        if (genericIndexer is not null)
         {
-            var indexParam = indexer.GetIndexParameters()[0];
+            var indexParam = genericIndexer.GetIndexParameters()[0];
             var convertedKey = EnsureType(key, indexParam.ParameterType);
-            return LinqExpression.MakeIndex(operand, indexer, [convertedKey]);
+            return LinqExpression.MakeIndex(operand, genericIndexer, [convertedKey]);
         }
 
         throw new CelException(
@@ -149,12 +169,21 @@ internal sealed class ExpressionCompiler
 
     private static LinqExpression VisitNegate(LinqExpression operand)
     {
+        // Handle INT64_MIN: -(9223372036854775808) where the literal overflows long
+        // but fits in ulong. The only valid case is negating ulong(long.MaxValue + 1) → long.MinValue.
+        if (operand is ConstantExpression { Value: ulong ulVal } && operand.Type == typeof(ulong))
+        {
+            if (ulVal == (ulong)long.MaxValue + 1)
+                return LinqExpression.Constant(long.MinValue, typeof(long));
+            throw new CelException("integer literal overflow");
+        }
+
         if (operand.Type == typeof(long))
-            return LinqExpression.Negate(operand);
+            return LinqExpression.NegateChecked(operand);
         if (operand.Type == typeof(double))
             return LinqExpression.Negate(operand);
         if (operand.Type == typeof(int))
-            return LinqExpression.Negate(LinqExpression.Convert(operand, typeof(long)));
+            return LinqExpression.NegateChecked(LinqExpression.Convert(operand, typeof(long)));
 
         throw new CelException($"cannot negate type {operand.Type.Name}");
     }
@@ -169,18 +198,15 @@ internal sealed class ExpressionCompiler
         if (binary.Op == BinaryOp.In)
             return VisitInOperator(binary);
 
+        // Special case: logical AND/OR need lazy evaluation for CEL error semantics
+        if (binary.Op == BinaryOp.And || binary.Op == BinaryOp.Or)
+            return VisitLogical(binary);
+
         var left = Visit(binary.Left);
         var right = Visit(binary.Right);
 
         return binary.Op switch
         {
-            // Logical
-            BinaryOp.And => LinqExpression.AndAlso(
-                EnsureType(left, typeof(bool)),
-                EnsureType(right, typeof(bool))),
-            BinaryOp.Or => LinqExpression.OrElse(
-                EnsureType(left, typeof(bool)),
-                EnsureType(right, typeof(bool))),
 
             // Comparison
             BinaryOp.Equal => MakeEqual(left, right),
@@ -193,12 +219,92 @@ internal sealed class ExpressionCompiler
             // Arithmetic
             BinaryOp.Add => MakeAdd(left, right),
             BinaryOp.Subtract => MakeSubtract(left, right),
-            BinaryOp.Multiply => MakeArithmetic(LinqExpression.Multiply, left, right),
-            BinaryOp.Divide => MakeArithmetic(LinqExpression.Divide, left, right),
-            BinaryOp.Modulo => MakeArithmetic(LinqExpression.Modulo, left, right),
+            BinaryOp.Multiply => MakeCheckedArithmetic(LinqExpression.MultiplyChecked, LinqExpression.Multiply, left, right),
+            BinaryOp.Divide => MakeDivide(left, right),
+            BinaryOp.Modulo => MakeModulo(left, right),
 
             _ => throw new CelException($"unsupported binary operator: {binary.Op}"),
         };
+    }
+
+    /// <summary>
+    /// CEL logical AND/OR with commutative error handling.
+    /// Both operands are wrapped in Func&lt;object&gt; so the runtime can catch errors
+    /// on either side and still short-circuit.
+    /// </summary>
+    private LinqExpression VisitLogical(CelExpr.Binary binary)
+    {
+        var left = Visit(binary.Left);
+        var right = Visit(binary.Right);
+
+        // If both sides are plain bools with no potential for errors, use simple AndAlso/OrElse
+        if (left.Type == typeof(bool) && right.Type == typeof(bool)
+            && !MightThrow(binary.Left) && !MightThrow(binary.Right))
+        {
+            return binary.Op == BinaryOp.And
+                ? LinqExpression.AndAlso(left, right)
+                : LinqExpression.OrElse(left, right);
+        }
+
+        // Wrap each side in a Func<object> lambda for deferred evaluation with error catching
+        var leftLambda = LinqExpression.Lambda<Func<object>>(EnsureType(left, typeof(object)));
+        var rightLambda = LinqExpression.Lambda<Func<object>>(EnsureType(right, typeof(object)));
+
+        var method = binary.Op == BinaryOp.And
+            ? CelFunctions.LogicalAndLazyMethod
+            : CelFunctions.LogicalOrLazyMethod;
+
+        // LogicalAndLazy/LogicalOrLazy return object — unbox to bool since CEL && / || always produce bool
+        return LinqExpression.Unbox(LinqExpression.Call(method, leftLambda, rightLambda), typeof(bool));
+    }
+
+    /// <summary>
+    /// Heuristic: does this expression potentially throw at runtime?
+    /// True for any expression containing division, modulo, function calls, or index access.
+    /// </summary>
+    private static bool MightThrow(CelExpr expr) => expr switch
+    {
+        CelExpr.Binary { Op: BinaryOp.Divide or BinaryOp.Modulo } => true,
+        CelExpr.Binary b => MightThrow(b.Left) || MightThrow(b.Right),
+        CelExpr.Unary u => MightThrow(u.Operand),
+        CelExpr.Conditional c => MightThrow(c.Condition) || MightThrow(c.TrueExpr) || MightThrow(c.FalseExpr),
+        CelExpr.Call => true,
+        CelExpr.Index => true,
+        _ => false,
+    };
+
+    /// <summary>
+    /// CEL logical AND with short-circuit semantics.
+    /// If both sides are bool, uses standard AndAlso.
+    /// Otherwise, uses a runtime helper that handles non-bool operands and error propagation.
+    /// </summary>
+    private static LinqExpression MakeLogicalAnd(LinqExpression left, LinqExpression right)
+    {
+        if (left.Type == typeof(bool) && right.Type == typeof(bool))
+            return LinqExpression.AndAlso(left, right);
+
+        // Runtime helper for non-bool operands
+        return LinqExpression.Call(
+            CelFunctions.LogicalAndMethod,
+            EnsureType(left, typeof(object)),
+            EnsureType(right, typeof(object)));
+    }
+
+    /// <summary>
+    /// CEL logical OR with short-circuit semantics.
+    /// If both sides are bool, uses standard OrElse.
+    /// Otherwise, uses a runtime helper that handles non-bool operands and error propagation.
+    /// </summary>
+    private static LinqExpression MakeLogicalOr(LinqExpression left, LinqExpression right)
+    {
+        if (left.Type == typeof(bool) && right.Type == typeof(bool))
+            return LinqExpression.OrElse(left, right);
+
+        // Runtime helper for non-bool operands
+        return LinqExpression.Call(
+            CelFunctions.LogicalOrMethod,
+            EnsureType(left, typeof(object)),
+            EnsureType(right, typeof(object)));
     }
 
     private LinqExpression MakeEqual(LinqExpression left, LinqExpression right)
@@ -216,6 +322,36 @@ internal sealed class ExpressionCompiler
             return LinqExpression.Equal(nonNull, nullConst);
         }
 
+        // Bytes equality: use SequenceEqual
+        if (left.Type == typeof(byte[]) && right.Type == typeof(byte[]))
+        {
+            return LinqExpression.Call(CelFunctions.BytesEqualMethod, left, right);
+        }
+
+        // Array/list structural equality: use CelFunctions.ArraysEqual
+        if (left.Type.IsArray && right.Type.IsArray)
+        {
+            return LinqExpression.Call(CelFunctions.ArraysEqualMethod,
+                LinqExpression.Convert(left, typeof(object)),
+                LinqExpression.Convert(right, typeof(object)));
+        }
+
+        // Dictionary equality: use CelFunctions.MapsEqual
+        if (IsDictionaryType(left.Type) && IsDictionaryType(right.Type))
+        {
+            return LinqExpression.Call(CelFunctions.MapsEqualMethod,
+                LinqExpression.Convert(left, typeof(object)),
+                LinqExpression.Convert(right, typeof(object)));
+        }
+
+        // Dynamic equality when one or both sides are object
+        if (left.Type == typeof(object) || right.Type == typeof(object))
+        {
+            return LinqExpression.Call(CelFunctions.DynamicEqualMethod,
+                EnsureType(left, typeof(object)),
+                EnsureType(right, typeof(object)));
+        }
+
         // Harmonise numeric types
         HarmoniseTypes(ref left, ref right);
         return LinqExpression.Equal(left, right);
@@ -226,6 +362,46 @@ internal sealed class ExpressionCompiler
         LinqExpression left,
         LinqExpression right)
     {
+        // CEL does not support ordering on null
+        if (IsNullConstant(left) || IsNullConstant(right))
+            throw new CelException("no such overload: comparison on null");
+
+        // String comparison: use string.Compare(a, b, StringComparison.Ordinal)
+        if (left.Type == typeof(string) && right.Type == typeof(string))
+        {
+            var compareResult = LinqExpression.Call(
+                CelFunctions.StringCompareOrdinal, left, right);
+            return factory(compareResult, LinqExpression.Constant(0));
+        }
+
+        // Bytes comparison: use CelFunctions.CompareBytes(a, b)
+        if (left.Type == typeof(byte[]) && right.Type == typeof(byte[]))
+        {
+            var compareResult = LinqExpression.Call(
+                CelFunctions.CompareBytesMethod, left, right);
+            return factory(compareResult, LinqExpression.Constant(0));
+        }
+
+        // Bool comparison: CEL defines false < true, so convert to int
+        if (left.Type == typeof(bool) && right.Type == typeof(bool))
+        {
+            var leftInt = LinqExpression.Condition(left,
+                LinqExpression.Constant(1), LinqExpression.Constant(0));
+            var rightInt = LinqExpression.Condition(right,
+                LinqExpression.Constant(1), LinqExpression.Constant(0));
+            return factory(leftInt, rightInt);
+        }
+
+        // Dynamic comparison when one side is object (e.g. from empty list iteration)
+        if (left.Type == typeof(object) || right.Type == typeof(object))
+        {
+            var compareResult = LinqExpression.Call(
+                CelFunctions.DynamicCompareMethod,
+                EnsureType(left, typeof(object)),
+                EnsureType(right, typeof(object)));
+            return factory(compareResult, LinqExpression.Constant(0));
+        }
+
         HarmoniseTypes(ref left, ref right);
         return factory(left, right);
     }
@@ -235,8 +411,96 @@ internal sealed class ExpressionCompiler
         LinqExpression left,
         LinqExpression right)
     {
+        // Dynamic arithmetic when one side is object
+        if (left.Type == typeof(object) || right.Type == typeof(object))
+        {
+            // Determine the operation name from the factory
+            var testResult = factory(LinqExpression.Constant(1), LinqExpression.Constant(1));
+            var opName = testResult.NodeType.ToString();
+            return LinqExpression.Call(
+                CelFunctions.DynamicArithmeticMethod,
+                EnsureType(left, typeof(object)),
+                EnsureType(right, typeof(object)),
+                LinqExpression.Constant(opName));
+        }
+
         HarmoniseTypes(ref left, ref right);
         return factory(left, right);
+    }
+
+    /// <summary>
+    /// Makes arithmetic that uses checked variants for integer types to detect overflow.
+    /// Falls back to unchecked for floating point.
+    /// </summary>
+    private static LinqExpression MakeCheckedArithmetic(
+        Func<LinqExpression, LinqExpression, LinqExpression> checkedFactory,
+        Func<LinqExpression, LinqExpression, LinqExpression> uncheckedFactory,
+        LinqExpression left,
+        LinqExpression right)
+    {
+        // Dynamic arithmetic when one side is object
+        if (left.Type == typeof(object) || right.Type == typeof(object))
+        {
+            var testResult = uncheckedFactory(LinqExpression.Constant(1), LinqExpression.Constant(1));
+            var opName = testResult.NodeType.ToString();
+            return LinqExpression.Call(
+                CelFunctions.DynamicArithmeticMethod,
+                EnsureType(left, typeof(object)),
+                EnsureType(right, typeof(object)),
+                LinqExpression.Constant(opName));
+        }
+
+        HarmoniseTypes(ref left, ref right);
+
+        // Use checked for integer types, unchecked for floating point
+        if (left.Type == typeof(double) || left.Type == typeof(float))
+            return uncheckedFactory(left, right);
+
+        return checkedFactory(left, right);
+    }
+
+    /// <summary>
+    /// Division — CEL requires divide-by-zero to be an eval error.
+    /// Also disallow double modulo.
+    /// </summary>
+    private static LinqExpression MakeDivide(LinqExpression left, LinqExpression right)
+    {
+        // Dynamic arithmetic when one side is object
+        if (left.Type == typeof(object) || right.Type == typeof(object))
+        {
+            return LinqExpression.Call(
+                CelFunctions.DynamicArithmeticMethod,
+                EnsureType(left, typeof(object)),
+                EnsureType(right, typeof(object)),
+                LinqExpression.Constant("Divide"));
+        }
+
+        HarmoniseTypes(ref left, ref right);
+        return LinqExpression.Divide(left, right);
+    }
+
+    /// <summary>
+    /// Modulo — CEL does not support % on doubles.
+    /// </summary>
+    private static LinqExpression MakeModulo(LinqExpression left, LinqExpression right)
+    {
+        // Dynamic arithmetic when one side is object
+        if (left.Type == typeof(object) || right.Type == typeof(object))
+        {
+            return LinqExpression.Call(
+                CelFunctions.DynamicArithmeticMethod,
+                EnsureType(left, typeof(object)),
+                EnsureType(right, typeof(object)),
+                LinqExpression.Constant("Modulo"));
+        }
+
+        HarmoniseTypes(ref left, ref right);
+
+        // CEL does not support modulo on doubles
+        if (left.Type == typeof(double) || left.Type == typeof(float))
+            throw new CelException("found no matching overload for '_%_' applied to '(double, double)'");
+
+        return LinqExpression.Modulo(left, right);
     }
 
     private static LinqExpression MakeAdd(LinqExpression left, LinqExpression right)
@@ -250,37 +514,86 @@ internal sealed class ExpressionCompiler
             return LinqExpression.Call(concatMethod, left, right);
         }
 
-        // Timestamp + Duration → DateTimeOffset.Add(TimeSpan)
+        // Bytes concatenation
+        if (left.Type == typeof(byte[]) && right.Type == typeof(byte[]))
+        {
+            return LinqExpression.Call(CelFunctions.ConcatBytesMethod, left, right);
+        }
+
+        // List concatenation (array + array)
+        if (left.Type.IsArray && right.Type.IsArray)
+        {
+            var leftElem = left.Type.GetElementType()!;
+            var rightElem = right.Type.GetElementType()!;
+
+            Type commonType;
+            if (leftElem == rightElem)
+                commonType = leftElem;
+            else if (leftElem == typeof(object) && rightElem != typeof(object))
+                commonType = rightElem; // empty list adapts to typed list
+            else if (rightElem == typeof(object) && leftElem != typeof(object))
+                commonType = leftElem; // empty list adapts to typed list
+            else
+                commonType = typeof(object);
+
+            var method = CelFunctions.ConcatArraysMethod.MakeGenericMethod(commonType);
+
+            // Convert arrays to the common element type if needed
+            var leftArr = leftElem == commonType
+                ? left
+                : LinqExpression.Call(CelFunctions.ConvertArrayMethod.MakeGenericMethod(commonType),
+                    LinqExpression.Convert(left, typeof(object)));
+            var rightArr = rightElem == commonType
+                ? right
+                : LinqExpression.Call(CelFunctions.ConvertArrayMethod.MakeGenericMethod(commonType),
+                    LinqExpression.Convert(right, typeof(object)));
+
+            return LinqExpression.Call(method, leftArr, rightArr);
+        }
+
+        // Timestamp + Duration → checked helper
         if (left.Type == typeof(DateTimeOffset) && right.Type == typeof(TimeSpan))
         {
-            var addMethod = typeof(DateTimeOffset).GetMethod(nameof(DateTimeOffset.Add), [typeof(TimeSpan)])!;
-            return LinqExpression.Call(left, addMethod, right);
+            return LinqExpression.Call(CelFunctions.TimestampAddDurationMethod, left, right);
         }
         if (left.Type == typeof(TimeSpan) && right.Type == typeof(DateTimeOffset))
         {
-            var addMethod = typeof(DateTimeOffset).GetMethod(nameof(DateTimeOffset.Add), [typeof(TimeSpan)])!;
-            return LinqExpression.Call(right, addMethod, left);
+            return LinqExpression.Call(CelFunctions.TimestampAddDurationMethod, right, left);
         }
 
-        // Duration + Duration → TimeSpan.Add(TimeSpan)
+        // Duration + Duration → checked helper
         if (left.Type == typeof(TimeSpan) && right.Type == typeof(TimeSpan))
         {
-            return LinqExpression.Add(left, right);
+            return LinqExpression.Call(CelFunctions.DurationAddDurationMethod, left, right);
         }
 
         HarmoniseTypes(ref left, ref right);
-        return LinqExpression.Add(left, right);
+
+        // Use checked for integer types
+        if (left.Type == typeof(double) || left.Type == typeof(float))
+            return LinqExpression.Add(left, right);
+        return LinqExpression.AddChecked(left, right);
     }
 
     /// <summary>
     /// CEL "in" operator: value in list → list.Contains(value)
+    ///                    value in map → map.ContainsKey(value)
     /// </summary>
     private LinqExpression VisitInOperator(CelExpr.Binary binary)
     {
         var value = Visit(binary.Left);
         var collection = Visit(binary.Right);
 
-        // Use Enumerable.Contains<T>(source, value)
+        // Map: key in map → map.ContainsKey(key)
+        if (collection.Type.IsGenericType &&
+            collection.Type.GetGenericTypeDefinition() == typeof(Dictionary<,>))
+        {
+            var keyType = collection.Type.GetGenericArguments()[0];
+            var containsKeyMethod = collection.Type.GetMethod(nameof(Dictionary<object, object>.ContainsKey))!;
+            return LinqExpression.Call(collection, containsKeyMethod, EnsureType(value, keyType));
+        }
+
+        // List/array: value in list → Enumerable.Contains
         var elementType = GetElementType(collection.Type) ?? value.Type;
         var containsMethod = CelFunctions.EnumerableContains.MakeGenericMethod(elementType);
         var convertedValue = EnsureType(value, elementType);
@@ -290,27 +603,30 @@ internal sealed class ExpressionCompiler
 
     private static LinqExpression MakeSubtract(LinqExpression left, LinqExpression right)
     {
-        // Timestamp - Duration → DateTimeOffset.Subtract(TimeSpan)
+        // Timestamp - Duration → checked helper
         if (left.Type == typeof(DateTimeOffset) && right.Type == typeof(TimeSpan))
         {
-            var subtractMethod = typeof(DateTimeOffset).GetMethod(nameof(DateTimeOffset.Subtract), [typeof(TimeSpan)])!;
-            return LinqExpression.Call(left, subtractMethod, right);
+            return LinqExpression.Call(CelFunctions.TimestampSubtractDurationMethod, left, right);
         }
 
-        // Timestamp - Timestamp → TimeSpan
+        // Timestamp - Timestamp → checked helper with duration range validation
         if (left.Type == typeof(DateTimeOffset) && right.Type == typeof(DateTimeOffset))
         {
-            return LinqExpression.Subtract(left, right);
+            return LinqExpression.Call(CelFunctions.TimestampSubtractTimestampMethod, left, right);
         }
 
-        // Duration - Duration → TimeSpan
+        // Duration - Duration → checked helper
         if (left.Type == typeof(TimeSpan) && right.Type == typeof(TimeSpan))
         {
-            return LinqExpression.Subtract(left, right);
+            return LinqExpression.Call(CelFunctions.DurationSubtractDurationMethod, left, right);
         }
 
         HarmoniseTypes(ref left, ref right);
-        return LinqExpression.Subtract(left, right);
+
+        // Use checked for integer types
+        if (left.Type == typeof(double) || left.Type == typeof(float))
+            return LinqExpression.Subtract(left, right);
+        return LinqExpression.SubtractChecked(left, right);
     }
 
     #endregion
@@ -331,6 +647,19 @@ internal sealed class ExpressionCompiler
     {
         var target = Visit(call.Target!);
 
+        // Duration-specific getters: target is TimeSpan
+        if (target.Type == typeof(TimeSpan))
+        {
+            return call.Function switch
+            {
+                "getHours" => LinqExpression.Call(CelFunctions.DurationGetHoursMethod, target),
+                "getMinutes" => LinqExpression.Call(CelFunctions.DurationGetMinutesMethod, target),
+                "getSeconds" => LinqExpression.Call(CelFunctions.DurationGetSecondsMethod, target),
+                "getMilliseconds" => LinqExpression.Call(CelFunctions.DurationGetMillisecondsMethod, target),
+                _ => throw new CelException($"unknown duration function '{call.Function}'"),
+            };
+        }
+
         return call.Function switch
         {
             "contains" => VisitStringMethod(target, call, CelFunctions.StringContains),
@@ -338,16 +667,27 @@ internal sealed class ExpressionCompiler
             "endsWith" => VisitStringMethod(target, call, CelFunctions.StringEndsWith),
             "size" => VisitSizeCall(target),
             "matches" => VisitMatchesCall(target, call),
-            // Timestamp member functions
-            "getFullYear" => VisitTimestampMethod(target, CelFunctions.TimestampGetFullYear),
-            "getMonth" => VisitTimestampMethod(target, CelFunctions.TimestampGetMonth),
-            "getDayOfMonth" => VisitTimestampMethod(target, CelFunctions.TimestampGetDayOfMonth),
-            "getDayOfWeek" => VisitTimestampMethod(target, CelFunctions.TimestampGetDayOfWeek),
-            "getDayOfYear" => VisitTimestampMethod(target, CelFunctions.TimestampGetDayOfYear),
-            "getHours" => VisitTimestampMethod(target, CelFunctions.TimestampGetHours),
-            "getMinutes" => VisitTimestampMethod(target, CelFunctions.TimestampGetMinutes),
-            "getSeconds" => VisitTimestampMethod(target, CelFunctions.TimestampGetSeconds),
-            "getMilliseconds" => VisitTimestampMethod(target, CelFunctions.TimestampGetMilliseconds),
+            // Timestamp member functions — with optional timezone arg
+            "getFullYear" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetFullYear, CelFunctions.TimestampGetFullYearTz),
+            "getMonth" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetMonth, CelFunctions.TimestampGetMonthTz),
+            "getDayOfMonth" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetDayOfMonth, CelFunctions.TimestampGetDayOfMonthTz),
+            "getDate" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetDate, CelFunctions.TimestampGetDateTz),
+            "getDayOfWeek" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetDayOfWeek, CelFunctions.TimestampGetDayOfWeekTz),
+            "getDayOfYear" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetDayOfYear, CelFunctions.TimestampGetDayOfYearTz),
+            "getHours" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetHours, CelFunctions.TimestampGetHoursTz),
+            "getMinutes" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetMinutes, CelFunctions.TimestampGetMinutesTz),
+            "getSeconds" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetSeconds, CelFunctions.TimestampGetSecondsTz),
+            "getMilliseconds" => VisitTimestampMethodWithTz(target, call,
+                CelFunctions.TimestampGetMilliseconds, CelFunctions.TimestampGetMillisecondsTz),
             _ => throw new CelException($"unknown receiver function '{call.Function}'"),
         };
     }
@@ -365,7 +705,8 @@ internal sealed class ExpressionCompiler
             "uint" when call.Args.Count == 1 => VisitTypeConversion(call, typeof(ulong)),
             "double" when call.Args.Count == 1 => VisitTypeConversion(call, typeof(double)),
             "string" when call.Args.Count == 1 => VisitStringConversion(call),
-            "bool" when call.Args.Count == 1 => VisitTypeConversion(call, typeof(bool)),
+            "bool" when call.Args.Count == 1 => VisitBoolConversion(call),
+            "bytes" when call.Args.Count == 1 => VisitBytesConversion(call),
 
             // Timestamp/Duration constructors
             "timestamp" when call.Args.Count == 1 => VisitTimestampConstructor(call),
@@ -470,7 +811,7 @@ internal sealed class ExpressionCompiler
     }
 
     /// <summary>
-    /// Type conversion: int(x), uint(x), double(x), bool(x) → Convert(x, targetType)
+    /// Type conversion: int(x), uint(x), double(x) → Convert(x, targetType) with range checking.
     /// </summary>
     private LinqExpression VisitTypeConversion(CelExpr.Call call, Type targetType)
     {
@@ -491,10 +832,6 @@ internal sealed class ExpressionCompiler
                 return LinqExpression.Call(
                     typeof(double).GetMethod(nameof(double.Parse), [typeof(string)])!,
                     arg);
-            if (targetType == typeof(bool))
-                return LinqExpression.Call(
-                    typeof(bool).GetMethod(nameof(bool.Parse), [typeof(string)])!,
-                    arg);
         }
 
         // Timestamp to int: epoch seconds
@@ -504,6 +841,23 @@ internal sealed class ExpressionCompiler
             return LinqExpression.Call(arg, toUnixMethod);
         }
 
+        // double → int with range check
+        if (arg.Type == typeof(double) && targetType == typeof(long))
+            return LinqExpression.Call(CelFunctions.DoubleToInt64Method, arg);
+
+        // double → uint with range check
+        if (arg.Type == typeof(double) && targetType == typeof(ulong))
+            return LinqExpression.Call(CelFunctions.DoubleToUint64Method, arg);
+
+        // ulong → long with range check
+        if (arg.Type == typeof(ulong) && targetType == typeof(long))
+            return LinqExpression.Call(CelFunctions.Uint64ToInt64Method, arg);
+
+        // long → ulong with range check
+        if (arg.Type == typeof(long) && targetType == typeof(ulong))
+            return LinqExpression.Call(CelFunctions.Int64ToUint64Method, arg);
+
+        // Identity: same type
         if (arg.Type == targetType)
             return arg;
 
@@ -511,7 +865,7 @@ internal sealed class ExpressionCompiler
     }
 
     /// <summary>
-    /// string(x) → Convert.ToString or .ToString() call
+    /// string(x) → proper CEL string conversion for each type.
     /// </summary>
     private LinqExpression VisitStringConversion(CelExpr.Call call)
     {
@@ -520,33 +874,147 @@ internal sealed class ExpressionCompiler
         if (arg.Type == typeof(string))
             return arg;
 
-        // For value types, call ToString()
+        // bytes → string: UTF-8 decode with validation
+        if (arg.Type == typeof(byte[]))
+            return LinqExpression.Call(CelFunctions.BytesToStringMethod, arg);
+
+        // int → string
+        if (arg.Type == typeof(long))
+            return LinqExpression.Call(CelFunctions.Int64ToStringMethod, arg);
+
+        // uint → string
+        if (arg.Type == typeof(ulong))
+            return LinqExpression.Call(CelFunctions.Uint64ToStringMethod, arg);
+
+        // double → string
+        if (arg.Type == typeof(double))
+            return LinqExpression.Call(CelFunctions.DoubleToStringMethod, arg);
+
+        // bool → string
+        if (arg.Type == typeof(bool))
+            return LinqExpression.Call(CelFunctions.BoolToStringMethod, arg);
+
+        // timestamp → string
+        if (arg.Type == typeof(DateTimeOffset))
+            return LinqExpression.Call(CelFunctions.TimestampToStringMethod, arg);
+
+        // duration → string
+        if (arg.Type == typeof(TimeSpan))
+            return LinqExpression.Call(CelFunctions.DurationToStringMethod, arg);
+
+        // Fallback: .ToString()
         var toStringMethod = arg.Type.GetMethod(nameof(object.ToString), Type.EmptyTypes)!;
         return LinqExpression.Call(arg, toStringMethod);
     }
 
     /// <summary>
-    /// timestamp("2023-01-01T00:00:00Z") → CelFunctions.ParseTimestamp(str)
+    /// bool(x) → CEL bool conversion.
+    /// bool(string) accepts "true"/"false"/"1"/"0"/"t"/"f" (case-sensitive).
+    /// bool(bool) is identity.
+    /// </summary>
+    private LinqExpression VisitBoolConversion(CelExpr.Call call)
+    {
+        var arg = Visit(call.Args[0]);
+
+        if (arg.Type == typeof(bool))
+            return arg;
+
+        if (arg.Type == typeof(string))
+            return LinqExpression.Call(CelFunctions.CelParseBoolMethod, arg);
+
+        throw new CelException($"no such overload: bool({arg.Type.Name})");
+    }
+
+    /// <summary>
+    /// bytes(x) → CEL bytes conversion.
+    /// bytes(string) → UTF-8 encode.
+    /// bytes(bytes) → identity.
+    /// </summary>
+    private LinqExpression VisitBytesConversion(CelExpr.Call call)
+    {
+        var arg = Visit(call.Args[0]);
+
+        if (arg.Type == typeof(byte[]))
+            return arg;
+
+        if (arg.Type == typeof(string))
+            return LinqExpression.Call(CelFunctions.StringToBytesMethod, arg);
+
+        throw new CelException($"no such overload: bytes({arg.Type.Name})");
+    }
+
+    /// <summary>
+    /// timestamp(x):
+    ///   timestamp(string) → CelFunctions.ParseTimestamp(str)
+    ///   timestamp(int)    → CelFunctions.TimestampFromEpoch(epochSeconds)
+    ///   timestamp(timestamp) → identity
     /// </summary>
     private LinqExpression VisitTimestampConstructor(CelExpr.Call call)
     {
         var arg = Visit(call.Args[0]);
+
+        // Identity: timestamp(timestamp) → pass-through
+        if (arg.Type == typeof(DateTimeOffset))
+            return arg;
+
+        // timestamp(int) → from epoch seconds
+        if (arg.Type == typeof(long))
+            return LinqExpression.Call(CelFunctions.TimestampFromEpochMethod, arg);
+
+        // timestamp(string)
         return LinqExpression.Call(CelFunctions.ParseTimestampMethod,
             EnsureType(arg, typeof(string)));
     }
 
     /// <summary>
-    /// duration("3600s") → CelFunctions.ParseDuration(str)
+    /// duration(x):
+    ///   duration(string)   → CelFunctions.ParseDuration(str)
+    ///   duration(duration)  → identity
     /// </summary>
     private LinqExpression VisitDurationConstructor(CelExpr.Call call)
     {
         var arg = Visit(call.Args[0]);
+
+        // Identity: duration(duration) → pass-through
+        if (arg.Type == typeof(TimeSpan))
+            return arg;
+
         return LinqExpression.Call(CelFunctions.ParseDurationMethod,
             EnsureType(arg, typeof(string)));
     }
 
     /// <summary>
-    /// Timestamp member access: ts.getFullYear() etc.
+    /// Timestamp member access: ts.getFullYear() or ts.getFullYear("timezone").
+    /// With 0 args, calls the UTC method. With 1 string arg, calls the timezone-aware method.
+    /// </summary>
+    private LinqExpression VisitTimestampMethodWithTz(
+        LinqExpression target, CelExpr.Call call,
+        MethodInfo utcMethod, MethodInfo tzMethod)
+    {
+        var tsExpr = EnsureType(target, typeof(DateTimeOffset));
+
+        if (call.Args.Count == 0)
+        {
+            // UTC variant
+            return LinqExpression.Convert(
+                LinqExpression.Call(utcMethod, tsExpr),
+                typeof(long));
+        }
+
+        if (call.Args.Count == 1)
+        {
+            // Timezone variant
+            var tzArg = Visit(call.Args[0]);
+            return LinqExpression.Convert(
+                LinqExpression.Call(tzMethod, tsExpr, EnsureType(tzArg, typeof(string))),
+                typeof(long));
+        }
+
+        throw new CelException($"{call.Function}() expects 0 or 1 arguments, got {call.Args.Count}");
+    }
+
+    /// <summary>
+    /// Timestamp member access: ts.getFullYear() etc. (UTC only, no timezone arg).
     /// </summary>
     private static LinqExpression VisitTimestampMethod(LinqExpression target, MethodInfo method)
     {
@@ -572,6 +1040,15 @@ internal sealed class ExpressionCompiler
     private LinqExpression VisitComprehension(CelExpr.Comprehension comp)
     {
         var source = Visit(comp.IterRange);
+
+        // For dictionaries, CEL iterates over keys, not KeyValuePairs
+        if (source.Type.IsGenericType &&
+            source.Type.GetGenericTypeDefinition() == typeof(Dictionary<,>))
+        {
+            var keysProp = source.Type.GetProperty("Keys")!;
+            source = LinqExpression.Property(source, keysProp);
+        }
+
         var elementType = GetElementType(source.Type)
             ?? throw new CelException($"cannot iterate over type {source.Type.Name}");
 
@@ -655,7 +1132,7 @@ internal sealed class ExpressionCompiler
     {
         var predicate = ExtractPredicateFromBinaryStep(comp);
         var lambda = BuildIterLambda(elementType, comp.IterVar, predicate);
-        var allMethod = CelFunctions.EnumerableAll.MakeGenericMethod(elementType);
+        var allMethod = CelFunctions.CelAllMethod.MakeGenericMethod(elementType);
         return LinqExpression.Call(allMethod, source, lambda);
     }
 
@@ -663,7 +1140,7 @@ internal sealed class ExpressionCompiler
     {
         var predicate = ExtractPredicateFromBinaryStep(comp);
         var lambda = BuildIterLambda(elementType, comp.IterVar, predicate);
-        var anyMethod = CelFunctions.EnumerableAny.MakeGenericMethod(elementType);
+        var anyMethod = CelFunctions.CelAnyMethod.MakeGenericMethod(elementType);
         return LinqExpression.Call(anyMethod, source, lambda);
     }
 
@@ -682,7 +1159,11 @@ internal sealed class ExpressionCompiler
         var predicate = condStep.Condition;
         var lambda = BuildIterLambda(elementType, comp.IterVar, predicate);
         var whereMethod = CelFunctions.EnumerableWhere.MakeGenericMethod(elementType);
-        return LinqExpression.Call(whereMethod, source, lambda);
+        var filtered = LinqExpression.Call(whereMethod, source, lambda);
+
+        // Materialise to array so equality/size works
+        var toArrayMethod = CelFunctions.EnumerableToArray.MakeGenericMethod(elementType);
+        return LinqExpression.Call(toArrayMethod, filtered);
     }
 
     private LinqExpression CompileMap(LinqExpression source, Type elementType, CelExpr.Comprehension comp)
@@ -701,8 +1182,13 @@ internal sealed class ExpressionCompiler
             var transformBody = transformList.Elements[0];
 
             var transformLambda = BuildIterLambda(elementType, comp.IterVar, transformBody);
-            var selectMethod = CelFunctions.EnumerableSelect.MakeGenericMethod(elementType, transformLambda.Body.Type);
-            return LinqExpression.Call(selectMethod, source, transformLambda);
+            var resultType = transformLambda.Body.Type;
+            var selectMethod = CelFunctions.EnumerableSelect.MakeGenericMethod(elementType, resultType);
+            var mapped = LinqExpression.Call(selectMethod, source, transformLambda);
+
+            // Materialise to array
+            var toArrayMethod = CelFunctions.EnumerableToArray.MakeGenericMethod(resultType);
+            return LinqExpression.Call(toArrayMethod, mapped);
         }
 
         // Simple map: LoopStep is Add(accu, [transform])
@@ -712,8 +1198,13 @@ internal sealed class ExpressionCompiler
             var transformBody = transformList.Elements[0];
 
             var transformLambda = BuildIterLambda(elementType, comp.IterVar, transformBody);
-            var selectMethod = CelFunctions.EnumerableSelect.MakeGenericMethod(elementType, transformLambda.Body.Type);
-            return LinqExpression.Call(selectMethod, source, transformLambda);
+            var resultType = transformLambda.Body.Type;
+            var selectMethod = CelFunctions.EnumerableSelect.MakeGenericMethod(elementType, resultType);
+            var mapped = LinqExpression.Call(selectMethod, source, transformLambda);
+
+            // Materialise to array
+            var toArrayMethod = CelFunctions.EnumerableToArray.MakeGenericMethod(resultType);
+            return LinqExpression.Call(toArrayMethod, mapped);
         }
 
         throw new CelException("unsupported map() comprehension structure");
@@ -731,6 +1222,13 @@ internal sealed class ExpressionCompiler
 
         // Ensure both branches have the same type
         HarmoniseTypes(ref ifTrue, ref ifFalse);
+
+        // If types still don't match after harmonisation, box to object
+        if (ifTrue.Type != ifFalse.Type)
+        {
+            ifTrue = EnsureType(ifTrue, typeof(object));
+            ifFalse = EnsureType(ifFalse, typeof(object));
+        }
 
         return LinqExpression.Condition(
             EnsureType(test, typeof(bool)),
@@ -760,6 +1258,35 @@ internal sealed class ExpressionCompiler
             .ToArray();
 
         return LinqExpression.NewArrayInit(elementType, converted);
+    }
+
+    #endregion
+
+    #region Map Creation
+
+    private LinqExpression VisitCreateMap(CelExpr.CreateMap map)
+    {
+        var dictType = typeof(Dictionary<object, object>);
+        var ctor = dictType.GetConstructor(Type.EmptyTypes)!;
+        var addMethod = dictType.GetMethod(nameof(Dictionary<object, object>.Add))!;
+
+        if (map.Entries.Count == 0)
+        {
+            // Empty map: new Dictionary<object, object>()
+            return LinqExpression.New(ctor);
+        }
+
+        var inits = new List<System.Linq.Expressions.ElementInit>();
+        foreach (var entry in map.Entries)
+        {
+            var key = Visit(entry.Key);
+            var value = Visit(entry.Value);
+            inits.Add(LinqExpression.ElementInit(addMethod,
+                EnsureType(key, typeof(object)),
+                EnsureType(value, typeof(object))));
+        }
+
+        return LinqExpression.ListInit(LinqExpression.New(ctor), inits);
     }
 
     #endregion
@@ -832,6 +1359,9 @@ internal sealed class ExpressionCompiler
         t == typeof(int) || t == typeof(long) || t == typeof(ulong) ||
         t == typeof(double) || t == typeof(float) ||
         t == typeof(short) || t == typeof(byte) || t == typeof(decimal);
+
+    private static bool IsDictionaryType(Type t) =>
+        t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Dictionary<,>);
 
     private static Type GetWiderIntegerType(Type a, Type b)
     {

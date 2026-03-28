@@ -281,6 +281,12 @@ public sealed class CelLexer
 
         if (long.TryParse(numLexeme, NumberStyles.Integer, CultureInfo.InvariantCulture, out long lval))
             return MakeTokenAtCurrent(TokenKind.IntLiteral, start, lval);
+
+        // If it overflows long but fits in ulong, emit as IntLiteral with ulong value.
+        // This allows the compiler to fold negate(9223372036854775808) → long.MinValue.
+        if (ulong.TryParse(numLexeme, NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong ulval))
+            return MakeTokenAtCurrent(TokenKind.IntLiteral, start, ulval);
+
         return MakeError($"invalid integer literal '{numLexeme}'", start);
     }
 
@@ -359,7 +365,6 @@ public sealed class CelLexer
                     case '\'': sb.Append('\''); break;
                     case '"': sb.Append('"'); break;
                     case '`': sb.Append('`'); break;
-                    case '0': sb.Append('\0'); break;
                     case 'x':
                     case 'X':
                         if (!TryScanHexEscape(2, out char hexChar))
@@ -510,7 +515,6 @@ public sealed class CelLexer
                     case '\\': bytes.Add((byte)'\\'); break;
                     case '\'': bytes.Add((byte)'\''); break;
                     case '"': bytes.Add((byte)'"'); break;
-                    case '0': bytes.Add(0); break;
                     case 'x' or 'X':
                         if (!TryScanHexEscape(2, out char hc))
                             return MakeError("invalid hex escape in bytes literal", start);
@@ -533,9 +537,16 @@ public sealed class CelLexer
             else
             {
                 char ch = Advance();
-                if (ch > 255)
-                    return MakeError("non-ASCII character in bytes literal", start);
-                bytes.Add((byte)ch);
+                // CEL bytes literals: non-ASCII chars get their UTF-8 encoding
+                if (ch > 127)
+                {
+                    foreach (var b in System.Text.Encoding.UTF8.GetBytes(new[] { ch }))
+                        bytes.Add(b);
+                }
+                else
+                {
+                    bytes.Add((byte)ch);
+                }
             }
         }
 

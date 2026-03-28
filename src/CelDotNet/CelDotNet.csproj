@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="CelDotNet.Tests" />
+    <InternalsVisibleTo Include="CelDotNet.Conformance" />
     <InternalsVisibleTo Include="CelDotNet.EntityFrameworkCore" />
   </ItemGroup>
 

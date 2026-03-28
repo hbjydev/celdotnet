@@ -15,4 +15,8 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="3.*" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="TestData\*.textproto" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
