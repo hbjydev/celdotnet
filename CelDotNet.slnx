@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CelDotNet.EntityFrameworkCore/CelDotNet.EntityFrameworkCore.csproj" />
+    <Project Path="src/CelDotNet/CelDotNet.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CelDotNet.Conformance/CelDotNet.Conformance.csproj" />
+    <Project Path="tests/CelDotNet.EntityFrameworkCore.Tests/CelDotNet.EntityFrameworkCore.Tests.csproj" />
+    <Project Path="tests/CelDotNet.Tests/CelDotNet.Tests.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/CelDotNet.Benchmarks/CelDotNet.Benchmarks.csproj" />
+  </Folder>
+</Solution>

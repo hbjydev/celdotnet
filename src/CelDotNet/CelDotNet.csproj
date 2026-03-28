@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>CelDotNet</PackageId>
+    <Description>A CEL (Common Expression Language) implementation for .NET that produces System.Linq.Expression trees, enabling CEL filters to be used with EF Core and IQueryable.</Description>
+    <PackageTags>cel;expression;filter;linq;efcore;entityframework</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CelDotNet.Tests" />
+    <InternalsVisibleTo Include="CelDotNet.EntityFrameworkCore" />
+  </ItemGroup>
+
+</Project>

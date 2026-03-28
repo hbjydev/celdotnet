@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>CelDotNet.EntityFrameworkCore</PackageId>
+    <Description>EF Core integration for CelDotNet, providing IQueryable extension methods for CEL filtering.</Description>
+    <PackageTags>cel;expression;filter;efcore;entityframework</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CelDotNet.EntityFrameworkCore.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CelDotNet\CelDotNet.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>
