@@ -94,6 +94,10 @@ public sealed class TypeEnvironment
             var attr = prop.GetCustomAttribute<CelFieldAttribute>();
             if (attr is not null)
             {
+                // Skip non-visible fields
+                if (!attr.Visible)
+                    continue;
+
                 fields.TryAdd(attr.Name, celType);
             }
 

@@ -51,6 +51,21 @@ public class CompilerContextTests
         var prop = CompilerContext.ResolveProperty(typeof(TestPerson), "nonexistent");
         Assert.Null(prop);
     }
+
+    [Fact]
+    public void ResolveProperty_ReturnsNull_ForNonVisibleField()
+    {
+        var prop = CompilerContext.ResolveProperty(typeof(TestPersonWithVisibility), "internal_id");
+        Assert.Null(prop);
+    }
+
+    [Fact]
+    public void ResolveProperty_FindsVisibleField()
+    {
+        var prop = CompilerContext.ResolveProperty(typeof(TestPersonWithVisibility), "public_name");
+        Assert.NotNull(prop);
+        Assert.Equal("PublicName", prop.Name);
+    }
 }
 
 // Test model classes
@@ -64,8 +79,17 @@ public class TestPerson
 
 public class TestPersonWithAttribute
 {
-    [CelField("display_name")]
+    [CelField("display_name", visible: true)]
     public string FullName { get; set; } = "";
 
     public int Age { get; set; }
+}
+
+public class TestPersonWithVisibility
+{
+    [CelField("internal_id", visible: false)]
+    public string InternalId { get; set; } = "";
+
+    [CelField("public_name", visible: true)]
+    public string PublicName { get; set; } = "";
 }

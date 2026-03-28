@@ -97,6 +97,10 @@ internal sealed class CompilerContext
             var attr = prop.GetCustomAttribute<CelFieldAttribute>();
             if (attr is not null)
             {
+                // Skip non-visible fields
+                if (!attr.Visible)
+                    continue;
+
                 cache.TryAdd(attr.Name, prop);
             }
 
