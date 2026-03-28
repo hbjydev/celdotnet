@@ -1,0 +1,42 @@
+name: Publish NuGet Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release /p:Version=${{ steps.version.outputs.VERSION }}
+
+      - name: Pack CelDotNet
+        run: dotnet pack src/CelDotNet/CelDotNet.csproj --no-build --configuration Release /p:Version=${{ steps.version.outputs.VERSION }} --output ./packages
+
+      - name: Pack CelDotNet.EntityFrameworkCore
+        run: dotnet pack src/CelDotNet.EntityFrameworkCore/CelDotNet.EntityFrameworkCore.csproj --no-build --configuration Release /p:Version=${{ steps.version.outputs.VERSION }} --output ./packages
+
+      - name: Push to GitHub NuGet
+        run: |
+          dotnet nuget add source --username hbjydev --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/hbjydev/index.json"
+          dotnet nuget push "./packages/*.nupkg" --source "github" --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
