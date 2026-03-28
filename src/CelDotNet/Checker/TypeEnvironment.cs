@@ -98,7 +98,8 @@ public sealed class TypeEnvironment
                 if (!attr.Visible)
                     continue;
 
-                fields.TryAdd(attr.Name, celType);
+                if (attr.Name is not null)
+                    fields.TryAdd(attr.Name, celType);
             }
 
             // 2. Exact match (property name as-is)
