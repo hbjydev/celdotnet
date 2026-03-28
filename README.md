@@ -1,8 +1,8 @@
 # CelDotNet
 
 [![CI](https://github.com/hbjydev/celdotnet/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hbjydev/celdotnet/actions/workflows/ci.yml)
-[![NuGet Version](https://img.shields.io/nuget/v/CelDotNet?label=CelDotNet)](https://www.nuget.org/packages/CelDotNet)
-[![NuGet Version](https://img.shields.io/nuget/v/CelDotNet.EntityFrameworkCore?label=EntityFrameworkCore)](https://www.nuget.org/packages/CelDotNet.EntityFrameworkCore)
+[![NuGet Version](https://img.shields.io/nuget/v/CelDotNet?logo=nuget&label=CelDotNet)](https://www.nuget.org/packages/CelDotNet)
+[![NuGet Version](https://img.shields.io/nuget/v/CelDotNet.EntityFrameworkCore?logo=nuget&label=EntityFrameworkCore)](https://www.nuget.org/packages/CelDotNet.EntityFrameworkCore)
 
 A [Common Expression Language (CEL)](https://cel.dev) implementation for .NET that compiles CEL expressions into `System.Linq.Expression` trees -- making it possible to use CEL filters directly with Entity Framework Core, `IQueryable`, or in-memory evaluation.
 
