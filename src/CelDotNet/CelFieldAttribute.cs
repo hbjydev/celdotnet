@@ -17,14 +17,15 @@ namespace CelDotNet;
 /// </example>
 [AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
 public sealed class CelFieldAttribute(
-    string name,
+    string? name = null,
     bool visible = true
 ) : Attribute
 {
     /// <summary>
     /// The CEL field name that maps to this property.
+    /// If null, the property name will be auto-detected using exact match or snake_case conversion.
     /// </summary>
-    public string Name { get; } = name ?? throw new ArgumentNullException(nameof(name));
+    public string? Name { get; } = name;
 
     /// <summary>
     /// Indicates whether this field should be included in the set of fields that can be queried by CEL expressions.

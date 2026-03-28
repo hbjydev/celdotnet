@@ -101,7 +101,11 @@ internal sealed class CompilerContext
                 if (!attr.Visible)
                     continue;
 
-                cache.TryAdd(attr.Name, prop);
+                // If name is explicitly set, use it
+                if (attr.Name is not null)
+                {
+                    cache.TryAdd(attr.Name, prop);
+                }
             }
 
             // 2. Exact match (property name as-is)
