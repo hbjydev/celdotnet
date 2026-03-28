@@ -136,6 +136,27 @@ public class Person
 // "age > 21"               -> resolves via snake_case -> PascalCase
 ```
 
+### Field Visibility Mapping
+
+CelDotNet provides the ability to mark some fields on a class or record as
+'visible' or not, which makes the field get skipped during expression
+compilation.
+
+```csharp
+using CelDotNet;
+
+public class Person
+{
+    // Included in .WhereCel()
+    [CelField(visible: true)]
+    public string Username { get; set; }
+
+    // Excluded from .WhereCel()
+    [CelField(visible: false)]
+    public string PasswordHash { get; set; }
+}
+```
+
 ## Supported CEL Features
 
 ### Types
